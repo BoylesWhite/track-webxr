@@ -28,7 +28,7 @@
     var line = new Date().toISOString().substr(11, 12) + ' ' + msg;
     console.log('[WebXR]', msg);
     debugLines.push(line);
-    if (debugLines.length > 40) debugLines.shift();
+    if (debugLines.length > 60) debugLines.shift();
     if (debugEl) debugEl.textContent = debugLines.join('\n');
   }
 
@@ -40,10 +40,10 @@
   }
 
   // ── Pre-flight checks ────────────────────────────────────────────────
-  dbg('Script loaded');
+  dbg('Script loaded (v3 - framebuffer fix)');
   dbg('navigator.xr: ' + (navigator.xr ? 'YES' : 'NO'));
   dbg('navigator.getVRDisplays: ' + ('getVRDisplays' in navigator ? 'YES (native WebVR, skipping polyfill)' : 'NO (will polyfill)'));
-  dbg('User agent: ' + navigator.userAgent.substr(0, 100));
+  dbg('User agent: ' + navigator.userAgent.substr(0, 120));
 
   if (!navigator.xr) {
     dbg('STOP: No WebXR API available');
@@ -76,8 +76,14 @@
   var xrLayer = null;
   var inXRFrame = false;
   var originalBindFramebuffer = null;
+  var originalViewport = null;
   var glContext = null;
   var supportedMode = null;
+  var xrFrameCount = 0;
+
+  // Cached per-eye viewport dimensions (updated each XR frame)
+  var eyeRenderWidth = 0;
+  var eyeRenderHeight = 0;
 
   // ── Detect supported session modes ────────────────────────────────────
   var modes = ['immersive-vr', 'immersive-ar', 'inline'];
@@ -107,6 +113,30 @@
     stageParameters: null,
     depthNear: 0.01,
     depthFar: 2000,
+
+    getEyeParameters: function (eye) {
+      // Three.js r90 WebVRManager calls this to determine render dimensions.
+      // It sets the renderer to (renderWidth * 2) x renderHeight.
+      var w, h;
+      if (eyeRenderWidth > 0) {
+        // Use actual XR viewport dimensions (set during first frame)
+        w = eyeRenderWidth;
+        h = eyeRenderHeight;
+      } else if (xrLayer && xrLayer.framebufferWidth > 1) {
+        w = Math.round(xrLayer.framebufferWidth / 2);
+        h = xrLayer.framebufferHeight;
+      } else {
+        // Reasonable defaults until XR layer is ready
+        var dpr = window.devicePixelRatio || 1;
+        w = Math.round(window.innerWidth * dpr);
+        h = Math.round(window.innerHeight * dpr);
+      }
+      return {
+        offset: new Float32Array([eye === 'left' ? -0.032 : 0.032, 0, 0]),
+        renderWidth: w,
+        renderHeight: h
+      };
+    },
 
     getFrameData: function (frameData) {
       if (!xrPose || !xrPose.views) return false;
@@ -215,13 +245,15 @@
           return navigator.xr.requestSession(supportedMode);
 
         }).then(function (session) {
-          dbg('XR session obtained! id=' + session);
+          dbg('XR session obtained: ' + session);
           xrSession = session;
 
           // Step 3: Create XR WebGL layer
           try {
             xrLayer = new XRWebGLLayer(session, glContext);
             dbg('XRWebGLLayer created: ' + xrLayer.framebufferWidth + 'x' + xrLayer.framebufferHeight);
+            dbg('XRWebGLLayer framebuffer: ' + xrLayer.framebuffer);
+            dbg('XRWebGLLayer antialias: ' + xrLayer.antialias);
           } catch (e) {
             fail('XRWebGLLayer creation failed', e);
             return;
@@ -239,31 +271,25 @@
             dbg('Reference space obtained: ' + refSpace);
 
             self.isPresenting = true;
-            setupFramebufferRedirect(glContext);
+            xrFrameCount = 0;
 
-            canvas.width = xrLayer.framebufferWidth;
-            canvas.height = xrLayer.framebufferHeight;
+            // Set up GL interception
+            setupGLIntercept(glContext);
 
-            dbg('SUCCESS - XR stereo rendering active!');
+            // DO NOT resize canvas here - dimensions may be 1x1.
+            // We'll update on the first real XR frame when we have viewport info.
 
-            // Hide debug panel during XR
+            dbg('Session ready - waiting for first XR frame...');
+
+            // Hide debug panel during XR (re-show on end)
             if (debugEl) debugEl.style.display = 'none';
 
             window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
               detail: { display: self }
             }));
 
-            resolve();
-          });
-
-        }).catch(function (err) {
-          fail('XR session setup failed', err);
-        });
-
-        // Handle session end
-        var checkEnd = setInterval(function () {
-          if (xrSession) {
-            xrSession.addEventListener('end', function () {
+            // Handle session end
+            session.addEventListener('end', function () {
               dbg('XR session ended');
               self.isPresenting = false;
               xrSession = null;
@@ -271,8 +297,12 @@
               xrPose = null;
               inXRFrame = false;
               xrLayer = null;
+              xrFrameCount = 0;
+              eyeRenderWidth = 0;
+              eyeRenderHeight = 0;
 
-              teardownFramebufferRedirect(glContext);
+              teardownGLIntercept(glContext);
+
               canvas.width = window.innerWidth * (window.devicePixelRatio || 1);
               canvas.height = window.innerHeight * (window.devicePixelRatio || 1);
 
@@ -282,10 +312,13 @@
                 detail: { display: self }
               }));
             });
-            clearInterval(checkEnd);
-          }
-        }, 50);
-        setTimeout(function () { clearInterval(checkEnd); }, 10000);
+
+            resolve();
+          });
+
+        }).catch(function (err) {
+          fail('XR session setup failed', err);
+        });
       });
     },
 
@@ -304,16 +337,60 @@
       if (xrSession) {
         return xrSession.requestAnimationFrame(function (time, frame) {
           inXRFrame = true;
+          xrFrameCount++;
 
+          // Get viewer pose
           if (xrRefSpace) {
-            xrPose = frame.getViewerPose(xrRefSpace);
+            try {
+              xrPose = frame.getViewerPose(xrRefSpace);
+            } catch (e) {
+              if (xrFrameCount < 3) dbg('getViewerPose error: ' + e.message);
+            }
           }
 
-          if (xrLayer && originalBindFramebuffer) {
-            originalBindFramebuffer(glContext.FRAMEBUFFER, xrLayer.framebuffer);
+          // Bind the XR framebuffer so Three.js renders into it
+          if (xrLayer && xrLayer.framebuffer) {
+            var gl = glContext;
+            if (originalBindFramebuffer) {
+              originalBindFramebuffer.call(gl, gl.FRAMEBUFFER, xrLayer.framebuffer);
+            }
           }
 
-          callback(time);
+          // On first frames, log XR layer info and update eye dimensions
+          if (xrFrameCount <= 3 && xrLayer) {
+            var fbW = xrLayer.framebufferWidth;
+            var fbH = xrLayer.framebufferHeight;
+            dbg('Frame ' + xrFrameCount + ': FB=' + fbW + 'x' + fbH +
+              ', pose=' + (xrPose ? xrPose.views.length + ' views' : 'null'));
+
+            if (xrPose && xrPose.views) {
+              for (var i = 0; i < xrPose.views.length; i++) {
+                var vp = xrLayer.getViewport(xrPose.views[i]);
+                dbg('  view[' + i + '] eye=' + xrPose.views[i].eye +
+                  ' VP=(' + vp.x + ',' + vp.y + ',' + vp.width + 'x' + vp.height + ')');
+
+                // Cache the per-eye render dimensions from the first real viewport
+                if (vp.width > 1 && eyeRenderWidth === 0) {
+                  eyeRenderWidth = vp.width;
+                  eyeRenderHeight = vp.height;
+                  dbg('Eye render size set: ' + eyeRenderWidth + 'x' + eyeRenderHeight);
+
+                  // Now resize the canvas to hold both eyes side-by-side
+                  var canvas = glContext.canvas;
+                  canvas.width = eyeRenderWidth * 2;
+                  canvas.height = eyeRenderHeight;
+                  dbg('Canvas resized to: ' + canvas.width + 'x' + canvas.height);
+                }
+              }
+            }
+          }
+
+          try {
+            callback(time);
+          } catch (e) {
+            if (xrFrameCount <= 3) dbg('Render callback error: ' + e.message);
+          }
+
           inXRFrame = false;
         });
       }
@@ -333,23 +410,58 @@
     }
   };
 
-  // ── GL Framebuffer Redirect ───────────────────────────────────────────
-  function setupFramebufferRedirect(gl) {
-    if (originalBindFramebuffer) return;
-    originalBindFramebuffer = gl.bindFramebuffer.bind(gl);
+  // ── GL Intercepts ─────────────────────────────────────────────────────
+  // Redirect bindFramebuffer(null) → XR framebuffer during XR frames,
+  // and redirect viewport() calls to match XR viewports.
+  function setupGLIntercept(gl) {
+    if (originalBindFramebuffer) return; // already set up
+
+    originalBindFramebuffer = gl.bindFramebuffer;
     gl.bindFramebuffer = function (target, framebuffer) {
-      if (inXRFrame && framebuffer === null && xrLayer) {
-        originalBindFramebuffer(target, xrLayer.framebuffer);
+      if (inXRFrame && framebuffer === null && xrLayer && xrLayer.framebuffer) {
+        // Three.js binds null (= default framebuffer = canvas).
+        // Redirect to the XR framebuffer instead.
+        originalBindFramebuffer.call(gl, target, xrLayer.framebuffer);
       } else {
-        originalBindFramebuffer(target, framebuffer);
+        originalBindFramebuffer.call(gl, target, framebuffer);
       }
+    };
+
+    originalViewport = gl.viewport;
+    gl.viewport = function (x, y, width, height) {
+      if (inXRFrame && xrPose && xrPose.views && xrLayer) {
+        // During XR, Three.js sets viewports based on the canvas/eye bounds.
+        // We need to map these to the actual XR layer viewports.
+        // Three.js r90 renders left eye at x=0, right eye at x=renderWidth.
+        // Detect which eye by x position and remap to XR viewport.
+        var views = xrPose.views;
+        if (views.length >= 2 && eyeRenderWidth > 0) {
+          var isRightEye = (x >= eyeRenderWidth - 1); // allow 1px tolerance
+          var viewIdx = isRightEye ? 1 : 0;
+
+          // Find by eye name for reliability
+          for (var i = 0; i < views.length; i++) {
+            if (isRightEye && views[i].eye === 'right') { viewIdx = i; break; }
+            if (!isRightEye && views[i].eye === 'left') { viewIdx = i; break; }
+          }
+
+          var vp = xrLayer.getViewport(views[viewIdx]);
+          originalViewport.call(gl, vp.x, vp.y, vp.width, vp.height);
+          return;
+        }
+      }
+      originalViewport.call(gl, x, y, width, height);
     };
   }
 
-  function teardownFramebufferRedirect(gl) {
+  function teardownGLIntercept(gl) {
     if (originalBindFramebuffer) {
       gl.bindFramebuffer = originalBindFramebuffer;
       originalBindFramebuffer = null;
+    }
+    if (originalViewport) {
+      gl.viewport = originalViewport;
+      originalViewport = null;
     }
   }
 
