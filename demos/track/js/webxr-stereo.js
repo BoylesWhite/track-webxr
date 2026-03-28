@@ -14,6 +14,8 @@
   if (!navigator.xr) return;
   if ('getVRDisplays' in navigator) return;
 
+  var LOG = '[WebXR Bridge]';
+
   // ── VRFrameData polyfill ──────────────────────────────────────────────
   if (typeof window.VRFrameData === 'undefined') {
     window.VRFrameData = function VRFrameData() {
@@ -31,14 +33,31 @@
   // ── State ─────────────────────────────────────────────────────────────
   var xrSession = null;
   var xrRefSpace = null;
-  var xrFrame = null;
   var xrPose = null;
   var xrLayer = null;
   var inXRFrame = false;
   var originalBindFramebuffer = null;
   var glContext = null;
-  var presentResolve = null;
-  var presentReject = null;
+  var supportedMode = null; // 'immersive-vr' or 'immersive-ar'
+
+  // ── Detect supported session mode early ───────────────────────────────
+  navigator.xr.isSessionSupported('immersive-vr').then(function (supported) {
+    if (supported) {
+      supportedMode = 'immersive-vr';
+      console.log(LOG, 'immersive-vr supported');
+    } else {
+      return navigator.xr.isSessionSupported('immersive-ar').then(function (arSupported) {
+        if (arSupported) {
+          supportedMode = 'immersive-ar';
+          console.log(LOG, 'immersive-ar supported (visionOS mode)');
+        } else {
+          console.log(LOG, 'No immersive session type supported');
+        }
+      });
+    }
+  }).catch(function (err) {
+    console.warn(LOG, 'Session support check failed:', err);
+  });
 
   // ── FakeVRDisplay ─────────────────────────────────────────────────────
   var FakeVRDisplay = {
@@ -57,21 +76,20 @@
     depthFar: 2000,
 
     getFrameData: function (frameData) {
-      if (!xrPose || !xrPose.views || xrPose.views.length < 2) {
+      if (!xrPose || !xrPose.views) {
         return false;
       }
 
       var views = xrPose.views;
-      var leftView = null;
-      var rightView = null;
 
+      // Handle mono (1 view) and stereo (2 views)
+      var leftView = views[0] || null;
+      var rightView = views.length > 1 ? views[1] : views[0];
+
+      // Prefer explicit eye assignment
       for (var i = 0; i < views.length; i++) {
-        if (views[i].eye === 'left' || (!leftView && i === 0)) {
-          leftView = views[i];
-        }
-        if (views[i].eye === 'right' || (!rightView && i === 1)) {
-          rightView = views[i];
-        }
+        if (views[i].eye === 'left') leftView = views[i];
+        if (views[i].eye === 'right') rightView = views[i];
       }
 
       if (!leftView || !rightView) return false;
@@ -134,50 +152,81 @@
       var self = this;
 
       return new Promise(function (resolve, reject) {
-        if (!navigator.xr) {
-          reject(new Error('WebXR not available'));
+        var mode = supportedMode;
+        if (!mode) {
+          reject(new Error('No supported WebXR session mode'));
           return;
         }
 
-        // Find the canvas GL context from the layers
+        console.log(LOG, 'requestPresent called, using mode:', mode);
+
+        // Find the canvas from the layers argument
         var source = layers && layers[0] && layers[0].source;
-        if (source) {
-          glContext = source.getContext('webgl') || source.getContext('webgl2');
-        }
+        var canvas = source || document.querySelector('canvas');
 
-        // If we couldn't get GL from layers, try to find the canvas
-        if (!glContext) {
-          var canvas = document.querySelector('canvas');
-          if (canvas) {
-            glContext = canvas.getContext('webgl') || canvas.getContext('webgl2');
-          }
-        }
-
-        if (!glContext) {
-          reject(new Error('Could not find WebGL context'));
+        if (!canvas) {
+          reject(new Error('No canvas found'));
           return;
         }
 
-        navigator.xr.requestSession('immersive-vr').then(function (session) {
+        // Get the existing GL context from the canvas
+        glContext = canvas.getContext('webgl2', { xrCompatible: true }) ||
+                    canvas.getContext('webgl', { xrCompatible: true });
+
+        // If getContext returns null, the context already exists without xrCompatible.
+        // Try to get the existing context and make it XR-compatible.
+        if (!glContext) {
+          glContext = canvas.getContext('webgl2') || canvas.getContext('webgl');
+        }
+
+        if (!glContext) {
+          reject(new Error('Could not get WebGL context'));
+          return;
+        }
+
+        // Make the GL context XR-compatible (required by some browsers)
+        var makeCompatible;
+        if (glContext.makeXRCompatible) {
+          makeCompatible = glContext.makeXRCompatible();
+        } else {
+          makeCompatible = Promise.resolve();
+        }
+
+        makeCompatible.then(function () {
+          console.log(LOG, 'GL context is XR-compatible, requesting session...');
+          return navigator.xr.requestSession(mode);
+        }).then(function (session) {
+          console.log(LOG, 'XR session created:', session);
           xrSession = session;
 
-          // Set up the XR WebGL layer
-          xrLayer = new XRWebGLLayer(session, glContext);
+          // Create the XR WebGL layer
+          try {
+            xrLayer = new XRWebGLLayer(session, glContext);
+          } catch (e) {
+            console.error(LOG, 'Failed to create XRWebGLLayer:', e);
+            reject(e);
+            return;
+          }
+
           session.updateRenderState({ baseLayer: xrLayer });
+          console.log(LOG, 'XR layer created, framebuffer:', xrLayer.framebufferWidth, 'x', xrLayer.framebufferHeight);
 
-          // Get a reference space for head tracking
-          session.requestReferenceSpace('local').then(function (refSpace) {
+          // Try 'local' first, fall back to 'viewer'
+          return session.requestReferenceSpace('local').catch(function () {
+            console.log(LOG, 'local refspace unavailable, trying viewer');
+            return session.requestReferenceSpace('viewer');
+          }).then(function (refSpace) {
             xrRefSpace = refSpace;
-
             self.isPresenting = true;
 
-            // Intercept framebuffer binding to redirect to XR framebuffer
+            // Intercept framebuffer binding
             setupFramebufferRedirect(glContext);
 
             // Update canvas size to match XR framebuffer
-            var canvas = glContext.canvas;
             canvas.width = xrLayer.framebufferWidth;
             canvas.height = xrLayer.framebufferHeight;
+
+            console.log(LOG, 'XR session active, stereo rendering enabled');
 
             // Dispatch the event the existing code listens for
             window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
@@ -185,78 +234,47 @@
             }));
 
             resolve();
-          }).catch(reject);
-
-          session.addEventListener('end', function () {
-            self.isPresenting = false;
-            xrSession = null;
-            xrRefSpace = null;
-            xrFrame = null;
-            xrPose = null;
-            inXRFrame = false;
-
-            // Restore framebuffer binding
-            teardownFramebufferRedirect(glContext);
-
-            // Restore canvas size
-            var canvas = glContext.canvas;
-            canvas.width = window.innerWidth * window.devicePixelRatio;
-            canvas.height = window.innerHeight * window.devicePixelRatio;
-
-            window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
-              detail: { display: self }
-            }));
           });
-
         }).catch(function (err) {
-          // If immersive-vr fails, try immersive-ar (visionOS fallback)
-          navigator.xr.requestSession('immersive-ar').then(function (session) {
-            xrSession = session;
-            xrLayer = new XRWebGLLayer(session, glContext);
-            session.updateRenderState({ baseLayer: xrLayer });
-
-            session.requestReferenceSpace('local').then(function (refSpace) {
-              xrRefSpace = refSpace;
-              self.isPresenting = true;
-
-              setupFramebufferRedirect(glContext);
-
-              var canvas = glContext.canvas;
-              canvas.width = xrLayer.framebufferWidth;
-              canvas.height = xrLayer.framebufferHeight;
-
-              window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
-                detail: { display: self }
-              }));
-
-              resolve();
-            }).catch(reject);
-
-            session.addEventListener('end', function () {
-              self.isPresenting = false;
-              xrSession = null;
-              xrRefSpace = null;
-              xrFrame = null;
-              xrPose = null;
-              inXRFrame = false;
-              teardownFramebufferRedirect(glContext);
-
-              var canvas = glContext.canvas;
-              canvas.width = window.innerWidth * window.devicePixelRatio;
-              canvas.height = window.innerHeight * window.devicePixelRatio;
-
-              window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
-                detail: { display: self }
-              }));
-            });
-
-          }).catch(reject);
+          console.error(LOG, 'Failed to start XR session:', err);
+          reject(err);
         });
+
+        // Handle session end
+        var onSessionEnd = function () {
+          console.log(LOG, 'XR session ended');
+          self.isPresenting = false;
+          xrSession = null;
+          xrRefSpace = null;
+          xrPose = null;
+          inXRFrame = false;
+          xrLayer = null;
+
+          teardownFramebufferRedirect(glContext);
+
+          // Restore canvas size
+          canvas.width = window.innerWidth * (window.devicePixelRatio || 1);
+          canvas.height = window.innerHeight * (window.devicePixelRatio || 1);
+
+          window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
+            detail: { display: self }
+          }));
+        };
+
+        // We set this up outside the promise chain so it's ready immediately.
+        // It's harmless if the session never starts (addEventListener on null is guarded).
+        var checkEnd = setInterval(function () {
+          if (xrSession) {
+            xrSession.addEventListener('end', onSessionEnd);
+            clearInterval(checkEnd);
+          }
+        }, 50);
+        // Safety: stop checking after 10s
+        setTimeout(function () { clearInterval(checkEnd); }, 10000);
       });
     },
 
     exitPresent: function () {
-      var self = this;
       return new Promise(function (resolve, reject) {
         if (xrSession) {
           xrSession.end().then(resolve).catch(reject);
@@ -269,7 +287,6 @@
     requestAnimationFrame: function (callback) {
       if (xrSession) {
         return xrSession.requestAnimationFrame(function (time, frame) {
-          xrFrame = frame;
           inXRFrame = true;
 
           // Get the viewer pose for this frame
@@ -278,8 +295,8 @@
           }
 
           // Bind the XR framebuffer before the app renders
-          if (xrLayer) {
-            glContext.bindFramebuffer(glContext.FRAMEBUFFER, xrLayer.framebuffer);
+          if (xrLayer && originalBindFramebuffer) {
+            originalBindFramebuffer(glContext.FRAMEBUFFER, xrLayer.framebuffer);
           }
 
           callback(time);
@@ -304,17 +321,13 @@
   };
 
   // ── GL Framebuffer Redirect ───────────────────────────────────────────
-  // When in XR, Three.js binds framebuffer null (the default) to render
-  // to screen. We need to redirect this to the XR framebuffer instead.
-
   function setupFramebufferRedirect(gl) {
-    if (originalBindFramebuffer) return; // Already set up
+    if (originalBindFramebuffer) return;
 
     originalBindFramebuffer = gl.bindFramebuffer.bind(gl);
 
     gl.bindFramebuffer = function (target, framebuffer) {
       if (inXRFrame && framebuffer === null && xrLayer) {
-        // Redirect null framebuffer to XR framebuffer during XR frames
         originalBindFramebuffer(target, xrLayer.framebuffer);
       } else {
         originalBindFramebuffer(target, framebuffer);
@@ -333,11 +346,15 @@
   navigator.getVRDisplays = function () {
     return navigator.xr.isSessionSupported('immersive-vr').then(function (supported) {
       if (supported) {
+        supportedMode = supportedMode || 'immersive-vr';
         return [FakeVRDisplay];
       }
-      // Try immersive-ar as fallback (visionOS)
       return navigator.xr.isSessionSupported('immersive-ar').then(function (arSupported) {
-        return arSupported ? [FakeVRDisplay] : [];
+        if (arSupported) {
+          supportedMode = supportedMode || 'immersive-ar';
+          return [FakeVRDisplay];
+        }
+        return [];
       });
     }).catch(function () {
       return [];
@@ -346,15 +363,21 @@
 
   // ── Dispatch initial vrdisplayconnect event after page loads ──────────
   window.addEventListener('DOMContentLoaded', function () {
-    navigator.getVRDisplays().then(function (displays) {
-      if (displays.length > 0) {
-        window.dispatchEvent(new CustomEvent('vrdisplayconnect', {
-          detail: { display: displays[0] }
-        }));
-      }
-    });
+    // Small delay to ensure main.min.js has set up its event listeners
+    setTimeout(function () {
+      navigator.getVRDisplays().then(function (displays) {
+        if (displays.length > 0) {
+          console.log(LOG, 'Dispatching vrdisplayconnect, mode:', supportedMode);
+          window.dispatchEvent(new CustomEvent('vrdisplayconnect', {
+            detail: { display: displays[0] }
+          }));
+        } else {
+          console.log(LOG, 'No XR displays found');
+        }
+      });
+    }, 100);
   });
 
-  console.log('[WebXR Bridge] WebVR-to-WebXR polyfill active');
+  console.log(LOG, 'WebVR-to-WebXR polyfill loaded');
 
 })();
