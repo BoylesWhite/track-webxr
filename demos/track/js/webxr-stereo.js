@@ -40,7 +40,7 @@
   }
 
   // ── Pre-flight checks ────────────────────────────────────────────────
-  dbg('Script loaded (v3 - framebuffer fix)');
+  dbg('Script loaded (v4 - scissor + viewport fix)');
   dbg('navigator.xr: ' + (navigator.xr ? 'YES' : 'NO'));
   dbg('navigator.getVRDisplays: ' + ('getVRDisplays' in navigator ? 'YES (native WebVR, skipping polyfill)' : 'NO (will polyfill)'));
   dbg('User agent: ' + navigator.userAgent.substr(0, 120));
@@ -338,6 +338,7 @@
         return xrSession.requestAnimationFrame(function (time, frame) {
           inXRFrame = true;
           xrFrameCount++;
+          if (xrFrameCount <= 3) vpLogCount = 0; // reset so we log viewport calls per frame
 
           // Get viewer pose
           if (xrRefSpace) {
@@ -412,7 +413,43 @@
 
   // ── GL Intercepts ─────────────────────────────────────────────────────
   // Redirect bindFramebuffer(null) → XR framebuffer during XR frames,
-  // and redirect viewport() calls to match XR viewports.
+  // and redirect viewport() + scissor() calls to match XR viewports.
+  var originalScissor = null;
+  var vpLogCount = 0;
+
+  function resolveXRViewport(gl, x, y, width, height, caller) {
+    // During XR, Three.js sets viewports based on the canvas/eye bounds.
+    // Three.js r90 renders left eye at x=0, right eye at x=renderWidth.
+    // Detect which eye by x position and remap to the actual XR viewport.
+    if (!inXRFrame || !xrPose || !xrPose.views || !xrLayer) return null;
+
+    var views = xrPose.views;
+    if (views.length < 2 || eyeRenderWidth === 0) return null;
+
+    // Log first few calls to help debug
+    if (vpLogCount < 20) {
+      vpLogCount++;
+      dbg(caller + '(' + x + ',' + y + ',' + width + ',' + height + ') eyeW=' + eyeRenderWidth);
+    }
+
+    // Determine which eye: x > 0 means right eye (Three.js puts right at x=renderWidth)
+    var isRightEye = (x > 0);
+    var viewIdx = 0;
+
+    for (var i = 0; i < views.length; i++) {
+      if (isRightEye && views[i].eye === 'right') { viewIdx = i; break; }
+      if (!isRightEye && views[i].eye === 'left') { viewIdx = i; break; }
+    }
+
+    var vp = xrLayer.getViewport(views[viewIdx]);
+
+    if (vpLogCount <= 20) {
+      dbg('  → mapped to eye=' + views[viewIdx].eye + ' VP=(' + vp.x + ',' + vp.y + ',' + vp.width + ',' + vp.height + ')');
+    }
+
+    return vp;
+  }
+
   function setupGLIntercept(gl) {
     if (originalBindFramebuffer) return; // already set up
 
@@ -429,28 +466,22 @@
 
     originalViewport = gl.viewport;
     gl.viewport = function (x, y, width, height) {
-      if (inXRFrame && xrPose && xrPose.views && xrLayer) {
-        // During XR, Three.js sets viewports based on the canvas/eye bounds.
-        // We need to map these to the actual XR layer viewports.
-        // Three.js r90 renders left eye at x=0, right eye at x=renderWidth.
-        // Detect which eye by x position and remap to XR viewport.
-        var views = xrPose.views;
-        if (views.length >= 2 && eyeRenderWidth > 0) {
-          var isRightEye = (x >= eyeRenderWidth - 1); // allow 1px tolerance
-          var viewIdx = isRightEye ? 1 : 0;
-
-          // Find by eye name for reliability
-          for (var i = 0; i < views.length; i++) {
-            if (isRightEye && views[i].eye === 'right') { viewIdx = i; break; }
-            if (!isRightEye && views[i].eye === 'left') { viewIdx = i; break; }
-          }
-
-          var vp = xrLayer.getViewport(views[viewIdx]);
-          originalViewport.call(gl, vp.x, vp.y, vp.width, vp.height);
-          return;
-        }
+      var vp = resolveXRViewport(gl, x, y, width, height, 'viewport');
+      if (vp) {
+        originalViewport.call(gl, vp.x, vp.y, vp.width, vp.height);
+      } else {
+        originalViewport.call(gl, x, y, width, height);
       }
-      originalViewport.call(gl, x, y, width, height);
+    };
+
+    originalScissor = gl.scissor;
+    gl.scissor = function (x, y, width, height) {
+      var vp = resolveXRViewport(gl, x, y, width, height, 'scissor');
+      if (vp) {
+        originalScissor.call(gl, vp.x, vp.y, vp.width, vp.height);
+      } else {
+        originalScissor.call(gl, x, y, width, height);
+      }
     };
   }
 
@@ -462,6 +493,10 @@
     if (originalViewport) {
       gl.viewport = originalViewport;
       originalViewport = null;
+    }
+    if (originalScissor) {
+      gl.scissor = originalScissor;
+      originalScissor = null;
     }
   }
 
