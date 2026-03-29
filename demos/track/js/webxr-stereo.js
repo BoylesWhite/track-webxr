@@ -10,37 +10,13 @@
 (function () {
   'use strict';
 
-  // ── On-screen debug overlay ───────────────────────────────────────────
-  var debugEl = null;
-  var debugLines = [];
-
-  function createDebugPanel() {
-    debugEl = document.createElement('div');
-    debugEl.id = 'webxr-debug';
-    debugEl.style.cssText =
-      'position:fixed;top:10px;left:10px;right:10px;max-height:50vh;overflow-y:auto;' +
-      'background:rgba(0,0,0,0.85);color:#0f0;font:12px/1.4 monospace;padding:10px;' +
-      'z-index:99999;border-radius:8px;pointer-events:none;white-space:pre-wrap;';
-    document.body.appendChild(debugEl);
-  }
-
+  // ── Debug logging (console only, no overlay) ────────────────────────
   function dbg(msg) {
-    var line = new Date().toISOString().substr(11, 12) + ' ' + msg;
     console.log('[WebXR]', msg);
-    debugLines.push(line);
-    if (debugLines.length > 60) debugLines.shift();
-    if (debugEl) debugEl.textContent = debugLines.join('\n');
-  }
-
-  // Create panel as soon as body exists
-  if (document.body) {
-    createDebugPanel();
-  } else {
-    document.addEventListener('DOMContentLoaded', createDebugPanel);
   }
 
   // ── Pre-flight checks ────────────────────────────────────────────────
-  dbg('Script loaded (v5 - autoplay + visibility fix)');
+  dbg('Script loaded (v6)');
   dbg('navigator.xr: ' + (navigator.xr ? 'YES' : 'NO'));
   dbg('navigator.getVRDisplays: ' + ('getVRDisplays' in navigator ? 'YES (native WebVR, skipping polyfill)' : 'NO (will polyfill)'));
   dbg('User agent: ' + navigator.userAgent.substr(0, 120));
@@ -321,8 +297,7 @@
 
             dbg('Session ready - waiting for first XR frame...');
 
-            // Hide debug panel during XR (re-show on end)
-            if (debugEl) debugEl.style.display = 'none';
+
 
             window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
               detail: { display: self }
@@ -360,8 +335,6 @@
 
               canvas.width = window.innerWidth * (window.devicePixelRatio || 1);
               canvas.height = window.innerHeight * (window.devicePixelRatio || 1);
-
-              if (debugEl) debugEl.style.display = '';
 
               window.dispatchEvent(new CustomEvent('vrdisplaypresentchange', {
                 detail: { display: self }
