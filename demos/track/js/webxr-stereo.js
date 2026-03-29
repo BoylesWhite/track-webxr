@@ -40,7 +40,7 @@
   }
 
   // ── Pre-flight checks ────────────────────────────────────────────────
-  dbg('Script loaded (v4 - scissor + viewport fix)');
+  dbg('Script loaded (v5 - autoplay + visibility fix)');
   dbg('navigator.xr: ' + (navigator.xr ? 'YES' : 'NO'));
   dbg('navigator.getVRDisplays: ' + ('getVRDisplays' in navigator ? 'YES (native WebVR, skipping polyfill)' : 'NO (will polyfill)'));
   dbg('User agent: ' + navigator.userAgent.substr(0, 120));
@@ -67,6 +67,42 @@
       };
     };
     dbg('VRFrameData polyfilled');
+  }
+
+  // ── Visibility API override ──────────────────────────────────────────
+  // When XR starts, visionOS Safari may mark the tab as "hidden",
+  // causing the app to pause itself. Override to keep it "visible".
+  var realHidden = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+  var realVisState = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+  var forceVisible = false;
+
+  function overrideVisibility(force) {
+    forceVisible = force;
+    if (force) {
+      dbg('Overriding visibility API (forcing visible)');
+      Object.defineProperty(document, 'hidden', {
+        get: function () { return false; },
+        configurable: true
+      });
+      Object.defineProperty(document, 'visibilityState', {
+        get: function () { return 'visible'; },
+        configurable: true
+      });
+      // Suppress visibilitychange events during XR
+      document.addEventListener('visibilitychange', suppressVisChange, true);
+    } else {
+      dbg('Restoring visibility API');
+      if (realHidden) Object.defineProperty(document, 'hidden', realHidden);
+      if (realVisState) Object.defineProperty(document, 'visibilityState', realVisState);
+      document.removeEventListener('visibilitychange', suppressVisChange, true);
+    }
+  }
+
+  function suppressVisChange(e) {
+    if (forceVisible) {
+      e.stopImmediatePropagation();
+      dbg('Suppressed visibilitychange event');
+    }
   }
 
   // ── State ─────────────────────────────────────────────────────────────
@@ -273,6 +309,10 @@
             self.isPresenting = true;
             xrFrameCount = 0;
 
+            // Override visibility API BEFORE dispatching events
+            // This prevents the app from pausing when visionOS hides the tab
+            overrideVisibility(true);
+
             // Set up GL interception
             setupGLIntercept(glContext);
 
@@ -288,9 +328,24 @@
               detail: { display: self }
             }));
 
+            // Auto-click the START button if the experience hasn't started yet.
+            // This triggers s.play() which starts the audio and camera animation.
+            setTimeout(function () {
+              var startBtn = document.querySelector('.start-button button') ||
+                             document.querySelector('.start-button') ||
+                             document.querySelector('button');
+              if (startBtn && startBtn.offsetParent !== null) {
+                dbg('Auto-clicking START button');
+                startBtn.click();
+              } else {
+                dbg('No visible START button found (already started?)');
+              }
+            }, 300);
+
             // Handle session end
             session.addEventListener('end', function () {
               dbg('XR session ended');
+              overrideVisibility(false);
               self.isPresenting = false;
               xrSession = null;
               xrRefSpace = null;
