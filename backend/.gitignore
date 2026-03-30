@@ -1,0 +1,3 @@
+node_modules/
+audio-cache/*.mp3
+.env

@@ -1,0 +1,14 @@
+{
+  "name": "track-audio-backend",
+  "version": "1.0.0",
+  "description": "YouTube audio extraction backend for Track visualizer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0"
+  }
+}
